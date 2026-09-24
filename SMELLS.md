@@ -119,15 +119,43 @@ built to save.
 
 One fix, behavior preserved, suite green, zero test edits.
 
-**Which smell you attacked.** And why that one.
+**Which smell you attacked.** Smell 1, the pricing rule implemented twice. It is the only one
+of the three where two copies can already disagree, and the suite can't catch it. It is
+also the one with a small, pure fix: the two copies compute the same thing in the same
+rounding order (base, premium, long, evening), so merging them changes no output.
 
-**What changed.** Files and methods you touched, and what the code does differently now.
+**What changed.**
+- New `src/pricing.ts`: `priceFor(room, start, end)` plus a private `applyDiscounts`, and the
+  five constants, now defined once. The code is moved from `ReservationManager`
+  unchanged.
+- `src/reservationManager.ts`: removed the five constants and the private `applyDiscounts`.
+  `calculatePrice` is now a one-line delegate to `priceFor`.
+- `src/reportGenerator.ts`: removed the five duplicated constants and the private `priceOf`
+  and `durationOf` (`durationOf` had no other caller). `revenue` now calls
+  `priceFor(room, booking.start, booking.end)`.
 
-**What you deliberately did not touch.** Name the scope line you drew and why you drew it
-there. "I ran out of time" is not a scope line.
+Callers see no difference. The rule now lives in one place, so a pricing change is one edit.
 
-**How you know behavior is preserved.** Point at the suite, say what it actually covers, and
-say what it would not catch.
+**What you deliberately did not touch.** The scope line: *remove the second copy of the rule,
+and change no observable behavior.*
+- I did not switch `revenue` to sum `booking.priceCents`. That is the more
+  Information-Expert fix, but it changes output when a room is re-registered with a new
+  rate: reports would show what was charged instead of the current rate. That is a
+  behavior change, so it is a decision for whoever owns reports, not a refactor.
+- I kept `ReservationManager.calculatePrice` as a public delegate instead of deleting it.
+  It is public API, and removing it would break callers for no gain in this fix.
+- I did not touch the other overlap duplicates (`hasConflict`, `isSlotFree`,
+  `overlapsWindow`, `freeMinutes` vs `occupancy`). They are the same kind of smell, but a
+  different rule. Folding them in would turn one small diff into a sweep.
+
+**How you know behavior is preserved.** `npm test` passes 39/39 and `npm run typecheck` is
+clean, with no test edited. The `pricing` tests in `tests/booking.test.ts` pin every branch
+of `priceFor` through `createBooking`: plain (12000), long (16200), premium (18400), and
+evening (11400). The `reports` tests in `tests/reporting.test.ts` check that revenue equals
+the sum of `priceCents`, for standard-room bookings only. What the suite would **not**
+catch: a premium or three-hour-plus booking priced differently in reports than at booking
+time. That gap is why the duplicate was dangerous. After this change it can't happen,
+because both paths call the same function.
 
 ---
 
