@@ -36,3 +36,7 @@ and `npm test`, once you enable workflows on your fork from the Actions tab.
 - Setup: `SETUP.md`
 
 See the Lab 5 handout on the course page for the three milestones you show a TA.
+
+## Tools used
+
+Claude Code (model: Claude Opus 5.5, `claude-opus-5-5`).

@@ -22,7 +22,8 @@ was written without the pricing code in view, so the agent rebuilt the rule inst
 reusing it. The constants being renamed (`LONG_BOOKING_MINUTES` vs `LONG_BOOKING_CUTOFF`,
 `EVENING_START_MINUTE` vs `EVENING_CUTOFF`) is the tell that this was a rewrite, not a copy.
 
-**Where in the code.**
+**Where in the code.** (Line numbers are for the starter code, commit `3ad9375`, before the
+Milestone 2 fix removed this duplicate.)
 - `src/reportGenerator.ts`, lines 4-8 (duplicated constants), `ReportGenerator.priceOf`
   lines 104-117, called from `revenue` at line 77.
 - Duplicates `src/reservationManager.ts`, lines 11-15 (original constants),
@@ -59,13 +60,13 @@ slow, so the agent guessed). Classic name: speculative generality plus dead code
   35-46 (never called).
 - `src/cache/cacheConfig.ts`, the whole file (lines 1-22): `withTtl` lines 15-17 and
   `disabled` lines 20-22 (never called).
-- The only caller: `src/reservationManager.ts`, constructor line 41 (hard-wires
-  `new QueryCache(DEFAULT_CACHE_CONFIG)`) and `listBookingsForRoom` lines 117-124 (the
-  always-missing lookup at lines 118-122).
+- The only caller: `src/reservationManager.ts`, constructor line 36 (hard-wires
+  `new QueryCache(DEFAULT_CACHE_CONFIG)`) and `listBookingsForRoom` lines 112-119 (the
+  always-missing lookup at lines 113-117).
 
 **The principle it violates.** Hidden coupling / controllability. The constructor always
 builds the cache itself from a module-level default (`new QueryCache(DEFAULT_CACHE_CONFIG)`,
-line 41), so a caller or test can't swap it out or disable it. The cache also reads the
+line 36), so a caller or test can't swap it out or disable it. The cache also reads the
 system clock (`Date.now()` in `get`/`set`), which nothing outside can control. So every read
 through `listBookingsForRoom` depends on state and time that aren't in any signature.
 
@@ -82,7 +83,10 @@ notification registry (`ChannelBuilder` map, `registerChannel`, `registeredChann
 `NotifierConfig`, a one-member `ChannelName` union) that has exactly one plugin, `email`.
 `ReservationManager` does not take a channel. Its constructor calls
 `createNotificationChannel(DEFAULT_NOTIFIER_CONFIG)`, which reads a module-level mutable
-`Map`.
+`Map`. `DEFAULT_NOTIFIER_CONFIG` looks like a setting, but the constructor has no parameter
+for it. The only way to change the channel is to change global state that every manager
+shares: either change the exported default object's fields, or overwrite the registry
+entry.
 
 **Classic or agent-specific.** Agent-specific: speculative over-abstraction, from an
 underspecified request (we never said how many channels there would be, so the agent built
@@ -94,8 +98,8 @@ dependency.
   `ChannelName` at line 4, the global `builders` map at line 19, `registerChannel` /
   `registeredChannels` lines 22-29, `createNotificationChannel` lines 32-40, and the single
   registration at line 42.
-- `src/reservationManager.ts`, constructor lines 38-42 (the hard-wired call at line 40), used
-  by `dispatchNotification` lines 215-218.
+- `src/reservationManager.ts`, constructor lines 33-37 (the hard-wired call at line 35), used
+  by `dispatchNotification` lines 194-197.
 
 **The principle it violates.** Low coupling (talk through interfaces). A
 `NotificationChannel` interface already exists, but `ReservationManager` doesn't take one
@@ -165,24 +169,82 @@ One proposal for each milestone 1 smell you did not fix.
 
 ### Proposal A (not coded)
 
-**The problem.** Name it.
+For smell 2, the query cache that never caches.
 
-**The decomposition.** What are the pieces, what does each own, and where do the rules live?
+**The problem.** Phantom complexity plus hidden coupling. `ReservationManager` builds a
+`QueryCache` it never fills. The cache reads a global default config and the system clock,
+and it has no invalidation for when bookings are written.
 
-**One cost.** Something this actually costs. "No real downside" is not a cost.
+**The decomposition.** Two steps. Only the first is proposed now.
+1. **Delete it.** Remove `src/cache/`, the `cache` field and its construction in the
+   `ReservationManager` constructor, and the dead lookup in `listBookingsForRoom`, which then
+   just returns `storage.findByRoom(roomId)`. This is behavior-preserving today, because
+   every lookup misses.
+2. **Only if a measured need appears** (e.g. storage becomes a slow database), put caching
+   *behind* the storage boundary instead of inside the manager: a
+   `CachingStorageProvider implements StorageProvider` that wraps another provider and
+   takes a clock as a constructor argument.
+   - The wrapper owns the cache and its invalidation.
+   - Invalidation lives in the wrapper's `save` and `update`, because every write goes
+     through them. That is exactly where the current design has nothing.
+   - `ReservationManager` keeps depending only on `StorageProvider` and never learns that
+     caching exists.
+
+**One cost.** `QueryCache`, `withTtl`, `disabled` and `DEFAULT_CACHE_CONFIG` are exported, and
+we can't see callers outside this repo. Deleting them is a breaking change for anyone who
+imports them. And if caching is ever really needed, someone has to write the wrapper from
+scratch instead of starting from existing code.
 
 ### Proposal B (not coded)
 
-**The problem.**
+For smell 3, the notification registry.
 
-**The decomposition.**
+**The problem.** Speculative over-abstraction and coupling that skips the interface. A plugin
+registry with one plugin, and a `ReservationManager` that gets its channel from the
+factory's global map and default config instead of depending only on
+`NotificationChannel`.
 
-**One cost.**
+**The decomposition.** Inject the channel through the constructor, the same way `storage`
+already is:
+`constructor(storage: StorageProvider = new InMemoryStorageProvider(), notifier: NotificationChannel = new EmailChannel())`.
+Then delete `src/notifications/notifierFactory.ts`. Each piece owns one decision:
+- **`ReservationManager`** decides *when* to notify (on confirm and cancel) and *what* to
+  say (the receipt from `formatReceipt`).
+- **A `NotificationChannel` implementation** (`EmailChannel`, later maybe `SmsChannel`)
+  decides *how* a message is delivered.
+- **Whoever constructs the manager** (application setup, or a test) decides *which* channel
+  is used. A test can now pass in a fake channel and check exactly what was sent, without
+  touching global state.
+
+**One cost.** The manager still has to import the concrete `EmailChannel` for its default
+argument, so it isn't fully decoupled from one implementation. Removing that default to get
+full decoupling would force every caller to build and pass a channel, including every
+existing test through `newService()` in `tests/fixtures.ts`.
 
 ### The thing that looks smelly but is fine
 
-**What it is.** File and method.
+**What it is.** `src/validation.ts`, `validateReservationRequest` (lines 14-63). It is about
+50 lines and eleven `if` checks, split up by section comments (`// Times.`, `// Capacity.`,
+...). It looks like Long method, and the comments look like Comments as deodorant.
 
-**Why it is fine.** Defend it with properties of the code, not with its line count.
+**Why it is fine.**
+- **It does one job.** Lecture's Long method was one method doing six jobs: validation,
+  availability, pricing, persistence, notification and logging. This one only validates.
+  It never touches storage, pricing, notifications or the clock.
+- **It is a pure function.** Given `(request, room)`, it returns a `ValidationResult`. There
+  are no side effects and no hidden dependencies, so every rule can be tested directly;
+  `tests/validation.test.ts` tests it without building a `ReservationManager`.
+- **The order of the checks is part of its contract.** It returns on the first problem "so
+  the caller can report one clear reason" (lines 10-13). The order decides which reason the
+  caller sees, e.g. a malformed time is reported before a capacity problem. Splitting the
+  checks into separate functions would still need a caller that runs them in this exact
+  order, so it would add indirection without removing any logic.
+- **The comments group the checks.** They don't restate what each line does.
 
-**What would flip your verdict.** Name the change that would turn this into a real problem.
+**What would flip your verdict.**
+- A rule that needs outside state, e.g. "no overlap with existing bookings" (needs storage)
+  or "book at least 24 hours ahead" (needs the clock). It would stop being pure, gain a
+  hidden dependency, and start mixing jobs.
+- More branching on room kind, e.g. `if (room.premium) ... else if (room.kind === 'lab')
+  ...`. That turns it into Type checks instead of polymorphism. The premium rule at lines
+  58-60 is the first branch of that kind, so this is the change to watch for.
